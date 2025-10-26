@@ -1,3 +1,18 @@
+- name: Quick API ping (quotes) – debug
+        env:
+          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
+        run: |
+          set -e
+          echo "Testing CMC quotes/latest…"
+          curl -s -H "X-CMC_PRO_API_KEY: $CMC_API_KEY" \
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=PIVX&convert=USD,BTC" \
+            -D /tmp/headers.txt -o /tmp/resp.json || true
+          echo "=== Response headers (tail) ==="
+          tail -n 30 /tmp/headers.txt || true
+          echo
+          echo "=== Response body (first 600 chars) ==="
+          head -c 600 /tmp/resp.json || true
+          echo
 name: Build CMC Privacy Feed (Warsaw)
 
 on:
