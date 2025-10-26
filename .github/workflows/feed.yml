@@ -1,27 +1,10 @@
-- name: Quick API ping (quotes) – debug
-        env:
-          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
-        run: |
-          set -e
-          echo "Testing CMC quotes/latest…"
-          curl -s -H "X-CMC_PRO_API_KEY: $CMC_API_KEY" \
-            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=PIVX&convert=USD,BTC" \
-            -D /tmp/headers.txt -o /tmp/resp.json || true
-          echo "=== Response headers (tail) ==="
-          tail -n 30 /tmp/headers.txt || true
-          echo
-          echo "=== Response body (first 600 chars) ==="
-          head -c 600 /tmp/resp.json || true
-          echo
 name: Build CMC Privacy Feed (Warsaw)
 
 on:
+  workflow_dispatch:
   schedule:
-    # קיץ (CEST, UTC+2): 08/14/20 -> 06/12/18 UTC
-    - cron: "0 6,12,18 * * *"
-    # חורף (CET, UTC+1): 08/14/20 -> 07/13/19 UTC
-    - cron: "0 7,13,19 * * *"
-  workflow_dispatch: {}
+    - cron: '0 6,12,18 * * *'  # קיץ (CEST, UTC+2) -> 08/14/20
+    - cron: '0 7,13,19 * * *'  # חורף (CET, UTC+1) -> 08/14/20
 
 permissions:
   contents: write
@@ -34,29 +17,13 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Show environment (debug)
-        run: |
-          python -V
-          ls -la
-          echo "Has secrets? -> ${{ secrets.CMC_API_KEY != '' }}"
+          python-version: '3.11'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Build latest.json
+      - name: Quick API ping (quotes) – debug
         env:
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
-        run: |
-          python build_feed.py
-
-      - name: Commit feed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest.json || true
-          git commit -m "Update feed $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "Nothing to commit"
-          git push || true
