@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 SYM_LIST = ["XMR","ZEC","BDX","DASH","ZANO","ROSE","SCRT","XVG","PIVX","FIRO","ARRR","BEAM"]
 API_KEY = os.getenv("CMC_API_KEY","").strip()
-if not API_KEY:
+ n not API_KEY:
     raise SystemExit("Missing CMC_API_KEY")
 
 def get(url, params=None):
