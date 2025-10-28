@@ -1,54 +1,120 @@
-name: Build CMC Privacy Feed (Warsaw)
-
+name: Update CMC Feed and Publish HTML+CSV
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '0 6,12,18 * * *'  # קיץ (CEST) -> 08/14/20 בוורשה
-    - cron: '0 7,13,19 * * *'  # חורף (CET) -> 08/14/20 בוורשה
-
-permissions:
-  contents: write
+    - cron: '0 5,11,17 * * *'  # 08:00 / 14:00 / 20:00 Asia/Nicosia
+  workflow_dispatch:
 
 jobs:
-  run:
+  update:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.x'
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-
-      - name: Quick API ping (quotes) – debug
+      - name: Fetch latest.json from CMC API
         env:
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
         run: |
-          set -e
-          echo "Testing CMC quotes/latest…"
-          curl -s -H "X-CMC_PRO_API_KEY: $CMC_API_KEY" \
-            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?symbol=PIVX&convert=USD,BTC" \
-            -D /tmp/headers.txt -o /tmp/resp.json || true
-          echo "=== Response headers (last lines) ==="
-          tail -n 20 /tmp/headers.txt || true
-          echo
-          echo "=== Response body (first 400 chars) ==="
-          head -c 400 /tmp/resp.json || true
-          echo
+          python << 'PY'
+          import requests, json, datetime
 
-      - name: Build latest.json
-        env:
-          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
-        run: python build_feed.py
+          # Fetch data from CoinMarketCap Privacy category using your API key
+          url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest?limit=500"
+          headers = {"X-CMC_PRO_API_KEY": "${{ secrets.CMC_API_KEY }}"}
+          r = requests.get(url, headers=headers)
+          data = r.json()
 
-      - name: Commit feed
+          coins_needed = ["XMR","ZEC","BDX","DASH","ZANO","ROSE","SCRT","XVG","PIVX","FIRO","ARRR","BEAM"]
+          output = {"timestamp": datetime.datetime.utcnow().isoformat()+"Z", "coins": {}}
+
+          for item in data["data"]:
+              symbol = item["symbol"]
+              if symbol in coins_needed:
+                  output["coins"][symbol] = {
+                      "USD_price": item["quote"]["USD"]["price"],
+                      "BTC_price": item["quote"]["BTC"]["price"],
+                      "market_cap": item["quote"]["USD"]["market_cap"],
+                      "volume_24h": item["quote"]["USD"]["volume_24h"]
+                  }
+
+          with open("latest.json","w",encoding="utf-8") as f:
+              json.dump(output,f,indent=2)
+          PY
+
+      - name: Build HTML & CSV from latest.json
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add latest.json || true
-          git commit -m "Update feed $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "Nothing to commit"
-          git push || true
+          python << 'PY'
+          import json, csv
+          from pathlib import Path
+
+          with open("latest.json","r",encoding="utf-8") as f:
+              payload = json.load(f)
+
+          coins = payload.get("coins", {})
+          ts_utc = payload.get("timestamp","")
+          Path("docs").mkdir(exist_ok=True)
+
+          # CSV
+          csv_path = "docs/latest.csv"
+          with open(csv_path,"w",newline="",encoding="utf-8") as fcsv:
+              w = csv.writer(fcsv)
+              w.writerow(["timestamp", ts_utc])
+              w.writerow(["symbol","USD_price","BTC_price","market_cap","volume_24h"])
+              for sym,data in coins.items():
+                  w.writerow([
+                      sym,
+                      data.get("USD_price",0),
+                      data.get("BTC_price",0),
+                      data.get("market_cap",0),
+                      data.get("volume_24h",0)
+                  ])
+
+          # HTML
+          total_mcap = sum((c.get("market_cap",0) or 0) for c in coins.values())
+          total_vol = sum((c.get("volume_24h",0) or 0) for c in coins.values())
+          rows = []
+          for sym,data in coins.items():
+              mcap = float(data.get("market_cap",0) or 0)
+              vol = float(data.get("volume_24h",0) or 0)
+              cap_share = (mcap/total_mcap*100) if total_mcap>0 else 0
+              vol_share = (vol/total_vol*100) if total_vol>0 else 0
+              rows.append((sym, data.get("USD_price",0), data.get("BTC_price",0), mcap, vol, cap_share, vol_share))
+          rows.sort(key=lambda r: r[4], reverse=True)
+
+          html = """<!doctype html>
+<html><head><meta charset='utf-8'><title>Privacy Coins Feed</title>
+<style>
+body{font-family:Arial, sans-serif;background:#fff;color:#111;margin:20px;}
+table{border-collapse:collapse;width:100%;}
+th,td{border:1px solid #ddd;padding:8px;text-align:right;}
+th{background:#f0f0f0;}
+.sym{text-align:left;font-weight:bold;}
+.pivx{background:#f9e6ff;}
+</style></head><body>
+<h2>Privacy Coins Feed</h2>
+<p>Timestamp (UTC): %s</p>
+<p>Total Market Cap: $%s<br>Total 24h Volume: $%s</p>
+<table><tr><th>Symbol</th><th>USD Price</th><th>BTC Price</th><th>Market Cap</th><th>24h Volume</th><th>%% of Sector</th><th>%% of 24h Volume</th></tr>
+""" % (ts_utc, f"{total_mcap:,.0f}", f"{total_vol:,.0f}")
+
+          for sym,usd,btc,mcap,vol,cap_s,vol_s in rows:
+              cls = " class='pivx'" if sym=="PIVX" else ""
+              html += f"<tr{cls}><td class='sym'>{sym}</td><td>{usd:,.4f}</td><td>{btc:,.8f}</td><td>${mcap:,.0f}</td><td>${vol:,.0f}</td><td>{cap_s:.2f}%%</td><td>{vol_s:.2f}%%</td></tr>"
+          html += "</table></body></html>"
+
+          with open("docs/latest.html","w",encoding="utf-8") as f:
+              f.write(html)
+          PY
+
+      - name: Commit & Push
+        run: |
+          git config user.name "CMC Feed Bot"
+          git config user.email "bot@cmcfeed.local"
+          git add latest.json docs/latest.csv docs/latest.html
+          git commit -m "Update CMC feed and publish HTML+CSV" || echo "No changes"
+          git push
