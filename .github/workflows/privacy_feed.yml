@@ -1,0 +1,145 @@
+name: Update CMC Privacy Feed + Publish HTML/CSV
+
+on:
+  schedule:
+    # GitHub Actions רץ ב-UTC. בניקוסיה עכשיו UTC+2 (חורף).
+    # 08:00 / 14:00 / 20:00 Asia/Nicosia == 06:00 / 12:00 / 18:00 UTC
+    - cron: '0 6,12,18 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Fetch CMC Privacy basket → latest.json
+        env:
+          CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
+        run: |
+          python << 'PY'
+          import os, json, datetime, requests
+
+          # סל המטבעות
+          symbols = "XMR,ZEC,BDX,DASH,ZANO,ROSE,SCRT,XVG,PIVX,FIRO,ARRR,BEAM"
+
+          # בקשה ל-API של CMC עם USD ו-BTC יחד
+          url = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
+          headers = {"X-CMC_PRO_API_KEY": os.environ["CMC_API_KEY"]}
+          params = {"symbol": symbols, "convert": "USD,BTC"}
+
+          r = requests.get(url, headers=headers, params=params, timeout=60)
+          r.raise_for_status()
+          data = r.json()["data"]
+
+          out = {"timestamp": datetime.datetime.utcnow().isoformat()+"Z", "coins": {}}
+
+          for sym in symbols.split(","):
+            item = data.get(sym, [None])
+            if isinstance(item, list) and item:
+              item = item[0]
+            if not item: 
+              continue
+            q_usd = item["quote"]["USD"]
+            q_btc = item["quote"]["BTC"]
+            out["coins"][sym] = {
+              "USD_price": float(q_usd["price"]),
+              "BTC_price": float(q_btc["price"]),
+              "market_cap": float(q_usd.get("market_cap") or 0),
+              "volume_24h": float(q_usd.get("volume_24h") or 0),
+            }
+
+          with open("latest.json","w",encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+          PY
+
+      - name: Build docs/latest.csv + docs/latest.html
+        run: |
+          python << 'PY'
+          import json, csv
+          from pathlib import Path
+
+          with open("latest.json","r",encoding="utf-8") as f:
+            payload = json.load(f)
+
+          coins = payload.get("coins", {})
+          ts_utc = payload.get("timestamp","")
+          Path("docs").mkdir(exist_ok=True)
+
+          # חישוב סכומים ונתחים
+          total_mcap = sum((c.get("market_cap",0) or 0) for c in coins.values())
+          total_vol  = sum((c.get("volume_24h",0) or 0) for c in coins.values())
+
+          # CSV
+          with open("docs/latest.csv","w",newline="",encoding="utf-8") as fcsv:
+            w = csv.writer(fcsv)
+            w.writerow(["timestamp_utc", ts_utc])
+            w.writerow(["symbol","USD_price","BTC_price","market_cap","volume_24h","cap_share_%","vol_share_%"])
+            for sym,dat in coins.items():
+              mcap = float(dat.get("market_cap",0) or 0)
+              vol  = float(dat.get("volume_24h",0) or 0)
+              cap_s = (mcap/total_mcap*100) if total_mcap>0 else 0
+              vol_s = (vol/total_vol*100) if total_vol>0 else 0
+              w.writerow([sym, dat.get("USD_price",0), dat.get("BTC_price",0), mcap, vol, cap_s, vol_s])
+
+          # HTML
+          rows = []
+          for sym,dat in coins.items():
+            mcap = float(dat.get("market_cap",0) or 0)
+            vol  = float(dat.get("volume_24h",0) or 0)
+            cap_s = (mcap/total_mcap*100) if total_mcap>0 else 0
+            vol_s = (vol/total_vol*100) if total_vol>0 else 0
+            rows.append((sym, dat.get("USD_price",0), dat.get("BTC_price",0), mcap, vol, cap_s, vol_s))
+          rows.sort(key=lambda r: r[4], reverse=True)  # לפי ווליום
+
+          html = f"""<!doctype html><html><head><meta charset='utf-8'>
+          <title>Privacy Coins — Latest</title>
+          <style>
+            body{{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#111;margin:20px}}
+            h1{{margin:0 0 8px}} .kpi{{display:flex;gap:16px;margin:12px 0}}
+            .kpi div{{background:#fafafa;border:1px solid #eee;border-radius:10px;padding:8px 12px}}
+            table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ddd;padding:6px 8px;text-align:right}}
+            th{{background:#f5f5f5}} td.sym{{text-align:left;font-weight:600}}
+            tr.pivx{{background:#f3e8ff}}
+            .small{{color:#666;font-size:13px}}
+          </style></head><body>
+          <h1>Privacy Coins — Latest</h1>
+          <div class='small'>Timestamp (UTC): {ts_utc}</div>
+          <div class='kpi'>
+            <div><b>Total Market Cap:</b> ${total_mcap:,.0f}</div>
+            <div><b>Total 24h Volume:</b> ${total_vol:,.0f}</div>
+          </div>
+          <table><thead><tr>
+            <th>Symbol</th><th>USD Price</th><th>BTC Price</th><th>Market Cap $</th><th>24h Volume $</th><th>% of Sector</th><th>% of 24h Volume</th>
+          </tr></thead><tbody>
+          """
+          for sym,usd,btc,mcap,vol,cap_s,vol_s in rows:
+            cls = " class='pivx'" if sym=="PIVX" else ""
+            html += f"<tr{cls}><td class='sym'>{sym}{' ★' if sym=='PIVX' else ''}</td><td>{usd:,.6f}</td><td>{btc:,.8f}</td><td>${mcap:,.0f}</td><td>${vol:,.0f}</td><td>{cap_s:.2f}%</td><td>{vol_s:.2f}%</td></tr>"
+          html += "</tbody></table><p class='small'>PIVX מודגש בסגול. נוצר אוטומטית ע\"י GitHub Actions.</p></body></html>"
+
+          with open("docs/latest.html","w",encoding="utf-8") as fh:
+            fh.write(html)
+          PY
+
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Auto-update CMC Privacy feed + publish docs" || echo "No changes"
+          git push
