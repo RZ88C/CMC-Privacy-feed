@@ -1,9 +1,8 @@
-name: Update CMC Privacy Feed + Publish HTML/CSV
+name: CMC Privacy – Fetch, Compare, Charts (08/14/20 Asia/Nicosia)
 
 on:
   schedule:
-    # GitHub Actions רץ ב-UTC. בניקוסיה עכשיו UTC+2 (חורף).
-    # 08:00 / 14:00 / 20:00 Asia/Nicosia == 06:00 / 12:00 / 18:00 UTC
+    # רץ ב-06:00, 12:00, 18:00 UTC  (≈ 08/14/20 Asia/Nicosia ברוב השנה)
     - cron: '0 6,12,18 * * *'
   workflow_dispatch: {}
 
@@ -25,121 +24,240 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          python -m pip install requests matplotlib pandas
 
-      - name: Fetch CMC Privacy basket → latest.json
+      - name: Fetch CMC Privacy basket → build latest.json/csv + charts
         env:
           CMC_API_KEY: ${{ secrets.CMC_API_KEY }}
         run: |
-          python << 'PY'
-          import os, json, datetime, requests
+          python - << 'PY'
+          import os, json, time, math, pathlib, io
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+          import requests
+          import pandas as pd
+          import matplotlib.pyplot as plt
 
-          # סל המטבעות
-          symbols = "XMR,ZEC,BDX,DASH,ZANO,ROSE,SCRT,XVG,PIVX,FIRO,ARRR,BEAM"
+          # -----------------------------
+          # CONFIG
+          # -----------------------------
+          CMC_API_KEY = os.environ.get("CMC_API_KEY")
+          if not CMC_API_KEY:
+            raise SystemExit("Missing CMC_API_KEY secret.")
 
-          # בקשה ל-API של CMC עם USD ו-BTC יחד
-          url = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
-          headers = {"X-CMC_PRO_API_KEY": os.environ["CMC_API_KEY"]}
-          params = {"symbol": symbols, "convert": "USD,BTC"}
+          # סל המטבעות הקבוע
+          SYMBOLS = ["XMR","ZEC","BDX","DASH","ZANO","ROSE","SCRT","XVG","PIVX","FIRO","ARRR","BEAM"]
 
-          r = requests.get(url, headers=headers, params=params, timeout=60)
-          r.raise_for_status()
-          data = r.json()["data"]
+          # קבצים שנוצר/נעדכן בריפו
+          LATEST_JSON = "latest.json"      # כמו שכבר עבדת עד עכשיו
+          PREV_JSON   = "prev.json"        # נשמור עותק להשוואה
+          LATEST_CSV  = "latest.csv"       # נוח לגיבוי/פתיחה אקסל
+          CHART_DIR   = "charts"           # תיקייה לגרפים
 
-          out = {"timestamp": datetime.datetime.utcnow().isoformat()+"Z", "coins": {}}
+          pathlib.Path(CHART_DIR).mkdir(exist_ok=True)
 
-          for sym in symbols.split(","):
-            item = data.get(sym, [None])
-            if isinstance(item, list) and item:
-              item = item[0]
-            if not item: 
+          # -----------------------------
+          # Helper: CMC quotes/latest (free plan → 1 convert per call)
+          # -----------------------------
+          BASE = "https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest"
+          HDRS = {"X-CMC_PRO_API_KEY": CMC_API_KEY}
+
+          def fetch_quotes(symbols, convert="USD"):
+            params = {
+              "symbol": ",".join(symbols),
+              "convert": convert
+            }
+            r = requests.get(BASE, headers=HDRS, params=params, timeout=30)
+            if r.status_code != 200:
+              raise SystemExit(f"CMC error {r.status_code}: {r.text[:250]}")
+            j = r.json()
+            if "data" not in j:
+              raise SystemExit(f"Unexpected CMC payload: {j}")
+            return j["data"]
+
+          # 1) מחזירים USD (market_cap, volume_24h, USD price)
+          data_usd = fetch_quotes(SYMBOLS, "USD")
+
+          # 2) מחזירים BTC (price in BTC)
+          # (מגבלת התוכנית החינמית לא מאפשרת 2 המרות בקריאה אחת)
+          time.sleep(1.0)  # נימוס קל בין הקריאות
+          data_btc = fetch_quotes(SYMBOLS, "BTC")
+
+          # -----------------------------
+          # Build clean snapshot
+          # -----------------------------
+          snapshot = {"timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                      "coins": {}}
+
+          for sym in SYMBOLS:
+            if sym not in data_usd or sym not in data_btc:
               continue
-            q_usd = item["quote"]["USD"]
-            q_btc = item["quote"]["BTC"]
-            out["coins"][sym] = {
-              "USD_price": float(q_usd["price"]),
-              "BTC_price": float(q_btc["price"]),
-              "market_cap": float(q_usd.get("market_cap") or 0),
-              "volume_24h": float(q_usd.get("volume_24h") or 0),
+            # חלק מה-assets מחזירים מערך (גרסאות שונות); נבחר האייטם הראשון
+            usd_obj = data_usd[sym][0]
+            btc_obj = data_btc[sym][0]
+            q_usd = usd_obj["quote"]["USD"]
+            q_btc = btc_obj["quote"]["BTC"]
+
+            # יש פרויקטים (לדוגמה ZANO) שלפעמים מחזירים 0 במרקט קאפ (חוסר נתונים)
+            mcap = float(q_usd.get("market_cap") or 0.0)
+            vol  = float(q_usd.get("volume_24h") or 0.0)
+            usd_price = float(q_usd.get("price") or 0.0)
+            btc_price = float(q_btc.get("price") or 0.0)
+
+            snapshot["coins"][sym] = {
+              "USD_price": usd_price,
+              "BTC_price": btc_price,
+              "market_cap": mcap,
+              "volume_24h": vol
             }
 
-          with open("latest.json","w",encoding="utf-8") as f:
-            json.dump(out, f, indent=2)
-          PY
+          # -----------------------------
+          # Compute sector totals + shares
+          # -----------------------------
+          def totals_and_shares(snap):
+            coins = snap["coins"]
+            sector_mcap = sum(c["market_cap"] for c in coins.values() if c["market_cap"]>0)
+            sector_vol  = sum(c["volume_24h"] for c in coins.values() if c["volume_24h"]>0)
+            shares = {}
+            for k,v in coins.items():
+              mc_share = (v["market_cap"]/sector_mcap) if sector_mcap>0 else 0.0
+              vo_share = (v["volume_24h"]/sector_vol) if sector_vol>0 else 0.0
+              shares[k] = {"mcap_share": mc_share, "vol_share": vo_share}
+            return sector_mcap, sector_vol, shares
 
-      - name: Build docs/latest.csv + docs/latest.html
-        run: |
-          python << 'PY'
-          import json, csv
-          from pathlib import Path
+          # Load previous snapshot if exists
+          prev = None
+          if os.path.exists(LATEST_JSON):
+            try:
+              with open(LATEST_JSON, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+              # נשמור העתק מפורש כ-prev.json
+              with open(PREV_JSON, "w", encoding="utf-8") as f:
+                json.dump(prev, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+              prev = None
 
-          with open("latest.json","r",encoding="utf-8") as f:
-            payload = json.load(f)
+          # totals + shares (now)
+          sector_mcap_now, sector_vol_now, shares_now = totals_and_shares(snapshot)
 
-          coins = payload.get("coins", {})
-          ts_utc = payload.get("timestamp","")
-          Path("docs").mkdir(exist_ok=True)
+          # totals + shares (previous)
+          shares_prev = {}
+          sector_mcap_prev = sector_vol_prev = None
+          if prev:
+            try:
+              sector_mcap_prev, sector_vol_prev, shares_prev = totals_and_shares(prev)
+            except Exception:
+              shares_prev = {}
 
-          # חישוב סכומים ונתחים
-          total_mcap = sum((c.get("market_cap",0) or 0) for c in coins.values())
-          total_vol  = sum((c.get("volume_24h",0) or 0) for c in coins.values())
+          # מצרפים לשנפשוט שדות סכימה
+          snapshot["sector_totals"] = {
+            "market_cap_sum": sector_mcap_now,
+            "volume_24h_sum": sector_vol_now
+          }
+          snapshot["shares"] = shares_now
 
-          # CSV
-          with open("docs/latest.csv","w",newline="",encoding="utf-8") as fcsv:
-            w = csv.writer(fcsv)
-            w.writerow(["timestamp_utc", ts_utc])
-            w.writerow(["symbol","USD_price","BTC_price","market_cap","volume_24h","cap_share_%","vol_share_%"])
-            for sym,dat in coins.items():
-              mcap = float(dat.get("market_cap",0) or 0)
-              vol  = float(dat.get("volume_24h",0) or 0)
-              cap_s = (mcap/total_mcap*100) if total_mcap>0 else 0
-              vol_s = (vol/total_vol*100) if total_vol>0 else 0
-              w.writerow([sym, dat.get("USD_price",0), dat.get("BTC_price",0), mcap, vol, cap_s, vol_s])
+          # -----------------------------
+          # Save latest.json + csv
+          # -----------------------------
+          with open(LATEST_JSON, "w", encoding="utf-8") as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
 
-          # HTML
+          # CSV טבלאי
           rows = []
-          for sym,dat in coins.items():
-            mcap = float(dat.get("market_cap",0) or 0)
-            vol  = float(dat.get("volume_24h",0) or 0)
-            cap_s = (mcap/total_mcap*100) if total_mcap>0 else 0
-            vol_s = (vol/total_vol*100) if total_vol>0 else 0
-            rows.append((sym, dat.get("USD_price",0), dat.get("BTC_price",0), mcap, vol, cap_s, vol_s))
-          rows.sort(key=lambda r: r[4], reverse=True)  # לפי ווליום
+          for sym, v in snapshot["coins"].items():
+            rows.append({
+              "symbol": sym,
+              "USD_price": v["USD_price"],
+              "BTC_price": v["BTC_price"],
+              "market_cap": v["market_cap"],
+              "volume_24h": v["volume_24h"],
+              "mcap_share": snapshot["shares"][sym]["mcap_share"],
+              "vol_share": snapshot["shares"][sym]["vol_share"]
+            })
+          df = pd.DataFrame(rows).sort_values("mcap_share", ascending=False)
+          df.to_csv(LATEST_CSV, index=False)
 
-          html = f"""<!doctype html><html><head><meta charset='utf-8'>
-          <title>Privacy Coins — Latest</title>
-          <style>
-            body{{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#111;margin:20px}}
-            h1{{margin:0 0 8px}} .kpi{{display:flex;gap:16px;margin:12px 0}}
-            .kpi div{{background:#fafafa;border:1px solid #eee;border-radius:10px;padding:8px 12px}}
-            table{{border-collapse:collapse;width:100%}} th,td{{border:1px solid #ddd;padding:6px 8px;text-align:right}}
-            th{{background:#f5f5f5}} td.sym{{text-align:left;font-weight:600}}
-            tr.pivx{{background:#f3e8ff}}
-            .small{{color:#666;font-size:13px}}
-          </style></head><body>
-          <h1>Privacy Coins — Latest</h1>
-          <div class='small'>Timestamp (UTC): {ts_utc}</div>
-          <div class='kpi'>
-            <div><b>Total Market Cap:</b> ${total_mcap:,.0f}</div>
-            <div><b>Total 24h Volume:</b> ${total_vol:,.0f}</div>
-          </div>
-          <table><thead><tr>
-            <th>Symbol</th><th>USD Price</th><th>BTC Price</th><th>Market Cap $</th><th>24h Volume $</th><th>% of Sector</th><th>% of 24h Volume</th>
-          </tr></thead><tbody>
-          """
-          for sym,usd,btc,mcap,vol,cap_s,vol_s in rows:
-            cls = " class='pivx'" if sym=="PIVX" else ""
-            html += f"<tr{cls}><td class='sym'>{sym}{' ★' if sym=='PIVX' else ''}</td><td>{usd:,.6f}</td><td>{btc:,.8f}</td><td>${mcap:,.0f}</td><td>${vol:,.0f}</td><td>{cap_s:.2f}%</td><td>{vol_s:.2f}%</td></tr>"
-          html += "</tbody></table><p class='small'>PIVX מודגש בסגול. נוצר אוטומטית ע\"י GitHub Actions.</p></body></html>"
+          # -----------------------------
+          # Build 4 charts (PNG)
+          # -----------------------------
+          # 1) Market-Cap Pie
+          plt.figure()
+          labels = []
+          sizes = []
+          for sym in SYMBOLS:
+            if sym in snapshot["coins"] and snapshot["coins"][sym]["market_cap"]>0:
+              labels.append(sym)
+              sizes.append(snapshot["coins"][sym]["market_cap"])
+          if sum(sizes) > 0:
+            plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
+            plt.title("Market-Cap Share (Privacy Basket)")
+            plt.tight_layout()
+            plt.savefig(f"{CHART_DIR}/market_cap_pie.png", dpi=160)
+          plt.close()
 
-          with open("docs/latest.html","w",encoding="utf-8") as fh:
-            fh.write(html)
+          # 2) 24h Volume Bars
+          plt.figure()
+          xs = []
+          ys = []
+          for sym in SYMBOLS:
+            if sym in snapshot["coins"]:
+              xs.append(sym)
+              ys.append(snapshot["coins"][sym]["volume_24h"])
+          plt.bar(xs, ys)
+          plt.title("24h Volume (USD)")
+          plt.xticks(rotation=45, ha="right")
+          plt.tight_layout()
+          plt.savefig(f"{CHART_DIR}/volume_24h_bars.png", dpi=160)
+          plt.close()
+
+          # 3) Money-Flow Map (Delta shares vs prev) – נציג כעמודות דלתא
+          if prev and "shares" in prev:
+            delta = []
+            labels = []
+            for sym in SYMBOLS:
+              now = shares_now.get(sym, {"mcap_share":0,"vol_share":0})
+              before = shares_prev.get(sym, {"mcap_share":0,"vol_share":0})
+              d = (now["mcap_share"] - before["mcap_share"]) + (now["vol_share"] - before["vol_share"])
+              delta.append(d*100)  # לאחוזים
+              labels.append(sym)
+            plt.figure()
+            colors = ["green" if d>=0 else "red" for d in delta]
+            plt.bar(labels, delta, color=colors)
+            plt.axhline(0, linewidth=1)
+            plt.title("Money-Flow Map: Δ Share (mcap+volume) vs prev run (pp)")
+            plt.xticks(rotation=45, ha="right")
+            plt.ylabel("percentage points")
+            plt.tight_layout()
+            plt.savefig(f"{CHART_DIR}/money_flow_map.png", dpi=160)
+            plt.close()
+
+          # 4) Sector Trend Meter – ניקח יחס ווליום/מרקטקאפ מול ממוצע היסטורי קצר
+          #    (אם אין prev → נחשב רק נקודה נוכחית)
+          def trend_score(mcap_sum, vol_sum):
+            # proxy גס: turnover = vol/mcap; ידידותי לסקטור
+            return (vol_sum/mcap_sum)*100 if mcap_sum>0 else 0.0
+
+          score_now = trend_score(sector_mcap_now, sector_vol_now)
+          score_prev = trend_score(sector_mcap_prev, sector_vol_prev) if prev else None
+          snapshot["trend_meter"] = {"turnover_pct_now": score_now, "turnover_pct_prev": score_prev}
+
+          # מציירים מחוג פשוט: נעשה בר כ־0–100
+          plt.figure(figsize=(4,1.0))
+          plt.barh(["turnover%"], [min(score_now,100.0)])
+          plt.xlim(0,100)
+          plt.title("Sector Trend Meter (turnover %)")
+          plt.tight_layout()
+          plt.savefig(f"{CHART_DIR}/sector_trend_meter.png", dpi=160)
+          plt.close()
+
+          # סוף
+          print("OK – latest.json/csv + charts created.")
           PY
 
       - name: Commit & Push
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Auto-update CMC Privacy feed + publish docs" || echo "No changes"
+          git commit -m "Auto: update latest.json/csv + charts" || echo "No changes"
           git push
